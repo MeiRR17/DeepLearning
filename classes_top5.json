@@ -1,0 +1,23 @@
+{
+  "class_names": [
+    "Tipecha",
+    "Mercha",
+    "Munach",
+    "Zaqef_Qatan",
+    "Pashta"
+  ],
+  "label_to_idx": {
+    "Tipecha": 0,
+    "Mercha": 1,
+    "Munach": 2,
+    "Zaqef_Qatan": 3,
+    "Pashta": 4
+  },
+  "class_counts": {
+    "Tipecha": 2546,
+    "Mercha": 2068,
+    "Munach": 1994,
+    "Zaqef_Qatan": 1548,
+    "Pashta": 1233
+  }
+}
