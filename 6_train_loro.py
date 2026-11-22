@@ -319,7 +319,7 @@ def train_fold(
         print(f"  ERROR: Held-out reader directory {test_dir} not found.")
         return {}
 
-    X_test, y_test, test_families, test_augmented = load_reader_dataset(
+    X_test, y_test, _, test_augmented = load_reader_dataset(
         test_dir, class_names, include_augmented=False
     )
     if test_augmented.any():
@@ -328,6 +328,12 @@ def train_fold(
 
     if X_test.shape[0] == 0:
         print(f"  ERROR: No test samples for {held_out_reader} — skipping fold.")
+        return {}
+
+    unseen_test_classes = set(np.unique(y_test)) - set(np.unique(y_train))
+    if unseen_test_classes:
+        print("  ERROR: Held-out test contains classes absent from training: "
+              + ", ".join(class_names[int(index)] for index in sorted(unseen_test_classes)))
         return {}
 
     # ── DataLoaders ────────────────────────────────────────────────────────
@@ -499,7 +505,12 @@ def train_fold(
         f.write("=" * 70 + "\n\n")
         f.write(f"Test Accuracy: {test_acc*100:.4f}%\n")
         f.write(f"Best Epoch   : {stopper.best_epoch}\n")
-        f.write(f"Best Val Loss: {stopper.best_loss:.4f}\n\n")
+        f.write(f"Best Val Loss: {stopper.best_loss:.4f}\n")
+        f.write(f"Training samples: {len(X_train)} "
+                f"({np.count_nonzero(~augmented_all[train_mask])} originals)\n")
+        f.write(f"Validation samples: {len(X_val)} original samples only\n")
+        f.write(f"Source families: train={len(set(family_all[train_mask]))}, "
+                f"validation={len(validation_families)}\n\n")
         f.write("CLASSIFICATION REPORT\n")
         f.write("-" * 70 + "\n")
         f.write(report)
@@ -522,6 +533,9 @@ def train_fold(
         "epochs_ran":   len(train_accs),
         "cm":           cm,
         "class_names":  class_names,
+        "train_groups": len(set(family_all[train_mask])),
+        "val_groups": len(validation_families),
+        "val_originals": len(X_val),
     }
 
 
@@ -540,7 +554,9 @@ def write_summary(results: list[dict]):
             f.write(f"Fold {r['fold']}  |  Held-out: {r['held_out']:3s}  "
                     f"|  Train: {r['train']}  "
                     f"|  Test Acc: {acc*100:.2f}%  "
-                    f"|  Best Epoch: {r['best_epoch']}\n")
+                    f"|  Best Epoch: {r['best_epoch']} "
+                    f"| Source families: train={r['train_groups']}, val={r['val_groups']}"
+                    f" | Val originals={r['val_originals']}\n")
         f.write("\n" + "-" * 70 + "\n")
         if accs:
             f.write(f"Mean Test Accuracy : {np.mean(accs)*100:.2f}%\n")
@@ -641,6 +657,10 @@ def main():
         if result:
             all_results.append(result)
 
+    if len(all_results) != len(set(args.folds)):
+        print("ERROR: Some requested folds were not completed. "
+              "Not writing a potentially misleading LORO summary.")
+        sys.exit(1)
     write_summary(all_results)
 
     print("\n" + "=" * 70)
