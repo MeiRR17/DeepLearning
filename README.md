@@ -99,6 +99,8 @@ The academic-grade pipeline is structured in clearly numbered steps:
 
 Augmented files are suffixed `_aug_ts.npy` and `_aug_ps.npy` and are automatically included in the **training** pool of the LORO script (never in the test set).
 
+**Validation leakage fix (feature branch):** augmentation families now stay together in a single split. The original spectrogram and its `_aug_ts` / `_aug_ps` siblings cannot be split between training and validation. Augmented variants are used **only** in training; validation and held-out reader testing use original samples. Results produced by the older random per-file validation split should not be directly compared to results from the corrected protocol.
+
 ---
 
 ## 📐 Leave-One-Reader-Out (LORO) Evaluation
@@ -405,3 +407,16 @@ This project is part of an academic Deep Learning course project.
 
 *Last Updated: June 2026*
 *Status: Final Phase — LORO + Augmentation + Grad-CAM pipeline ready; awaiting R2/R3 audio data*
+
+
+## Research protocol: augmentation-safe LORO validation
+
+The previous `6_train_loro.py` split its training pool **after** adding synthetic time-stretched and pitch-shifted copies. An augmented spectrogram could therefore end up in training while its original appeared in validation, inflating validation accuracy and affecting early stopping. This PR changes the split to be **source-family grouped and deterministic** (`42 + fold index` seed).
+
+For each training reader and class, the script derives source-family IDs from the original `.npy` filename. The original and files ending in `_aug_ts.npy` or `_aug_ps.npy` share that ID. Validation groups are selected from original families, with at least one family kept in training for each class; if a class has only one original family, that class contributes training examples only and a warning is printed. If no leakage-free validation split can be constructed, that fold fails rather than silently leaking data.
+
+Validation and the held-out reader's test set exclude all augmented samples. Synthetic siblings for a validation family are not trained on. Every fold's metrics file and the overall summary record validation source-family counts. If a held-out test class is absent from training, the fold fails; if any requested fold is incomplete, the script exits nonzero and does not write a new overall LORO summary.
+
+**Important research limitations:** This only groups files with the documented suffix pattern. Different recordings of the same utterance, manually duplicated/renamed arrays, or closely neighboring windows extracted from the same continuous recording may still be correlated. For publication-grade validation, group at the original recording/verse level using explicit source metadata, audit duplicate files and report the sample counts per class. Previously reported validation numbers may have benefited from the old leakage-prone split and should be treated as provisional.
+
+The existing train/test reader separation is preserved. No retraining, experiments or tests were performed as part of this code-only change.

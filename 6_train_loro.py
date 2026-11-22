@@ -20,8 +20,10 @@ Dataset layout expected
     dataset_r2/            <- R2 spectrograms  (same layout)
     dataset_r3/            <- R3 spectrograms  (same layout)
 
-  Augmented files (*_aug_ts.npy, *_aug_ps.npy) inside each directory are
-  automatically included in the training pool (but never in the test set).
+  Augmented files (*_aug_ts.npy, *_aug_ps.npy) are loaded from training
+  readers, but original source families are assigned to training or validation
+  BEFORE augmentation can be used. Validation and held-out test contain only
+  original samples. This prevents augmented siblings leaking into validation.
 
 Outputs (saved to project root)
 ---------------------------------------------------------------------------
@@ -149,55 +151,57 @@ class EarlyStopping:
 
 # ── Dataset loading ──────────────────────────────────────────────────────────
 
-def load_reader_dataset(reader_dir: Path, class_names: list[str],
-                        include_augmented: bool = True) -> tuple[np.ndarray, np.ndarray]:
+def load_reader_dataset(
+    reader_dir: Path, class_names: list[str], include_augmented: bool = True
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load spectrograms, labels, source-family IDs, and augmentation flags.
+
+    The source-family ID groups an original spectrogram with its generated
+    *_aug_ts / *_aug_ps siblings. It includes reader and class to distinguish
+    identical stems across readers and cantillation categories.
     """
-    Load all .npy spectrograms from reader_dir/<taam>/*.npy.
-
-    Parameters
-    ----------
-    reader_dir       : Root directory for this reader's spectrograms.
-    class_names      : Ordered list of class names (defines label indices).
-    include_augmented: If False, skip files ending in _aug_ts.npy / _aug_ps.npy.
-
-    Returns
-    -------
-    X : float32 array of shape (N, N_MELS, MAX_FRAMES)
-    y : int32   array of shape (N,)
-    """
-    name_to_idx = {name: idx for idx, name in enumerate(class_names)}
-    X_list, y_list = [], []
-
-    for taam in class_names:
+    X_list, y_list, families, augmented = [], [], [], []
+    for label, taam in enumerate(class_names):
         taam_dir = reader_dir / taam
         if not taam_dir.is_dir():
             continue
 
         for npy_path in sorted(taam_dir.glob("*.npy")):
             stem = npy_path.stem
-            if not include_augmented and (
-                stem.endswith("_aug_ts") or stem.endswith("_aug_ps")
-            ):
+            is_augmented = stem.endswith(("_aug_ts", "_aug_ps"))
+            if is_augmented and not include_augmented:
                 continue
+            original_stem = stem
+            if is_augmented:
+                original_stem = stem.rsplit("_aug_", 1)[0]
+            arr = np.load(str(npy_path), allow_pickle=False).astype(np.float32)
+            if arr.ndim != 2:
+                raise ValueError(f"Expected a 2D spectrogram: {npy_path}")
 
-            arr = np.load(str(npy_path)).astype(np.float32)
-
-            # Pad / truncate to canonical shape
             h, w = arr.shape
             if h != N_MELS:
                 arr = arr[:N_MELS] if h > N_MELS else np.pad(
-                    arr, ((0, N_MELS - h), (0, 0)), mode='constant')
+                    arr, ((0, N_MELS - h), (0, 0)), mode="constant"
+                )
             if w != MAX_FRAMES:
                 arr = arr[:, :MAX_FRAMES] if w > MAX_FRAMES else np.pad(
-                    arr, ((0, 0), (0, MAX_FRAMES - w)), mode='constant')
-
+                    arr, ((0, 0), (0, MAX_FRAMES - w)), mode="constant"
+                )
+            if not np.isfinite(arr).all():
+                raise ValueError(f"Non-finite spectrogram values: {npy_path}")
             X_list.append(arr)
-            y_list.append(name_to_idx[taam])
+            y_list.append(label)
+            families.append(f"{reader_dir.name}/{taam}/{original_stem}")
+            augmented.append(is_augmented)
 
     if not X_list:
-        return np.empty((0, N_MELS, MAX_FRAMES), dtype=np.float32), np.empty(0, dtype=np.int32)
-
-    return np.stack(X_list).astype(np.float32), np.array(y_list, dtype=np.int32)
+        return (np.empty((0, N_MELS, MAX_FRAMES), dtype=np.float32),
+                np.empty(0, dtype=np.int32),
+                np.empty(0, dtype=object),
+                np.empty(0, dtype=bool))
+    return (np.stack(X_list), np.asarray(y_list, dtype=np.int32),
+            np.asarray(families, dtype=object),
+            np.asarray(augmented, dtype=bool))
 
 
 def discover_classes(reader_dirs: list[Path]) -> list[str]:
@@ -232,39 +236,82 @@ def train_fold(
     print(f"FOLD {fold_idx} | Held-out: {held_out_reader} | Train: {train_readers}")
     print(f"{'='*70}")
 
-    # ── Load training data (with augmentation) ────────────────────────────
-    X_parts, y_parts = [], []
+    # ── Load training readers, retaining original/augmentation families ──
+    X_parts, y_parts, family_parts, augmented_parts = [], [], [], []
     for rdr in train_readers:
         rdir = READER_DIRS[rdr]
         if not rdir.is_dir():
-            print(f"  WARNING: {rdir} not found — skipping {rdr}.")
-            continue
-        X_r, y_r = load_reader_dataset(rdir, class_names, include_augmented=True)
-        print(f"  {rdr}: {X_r.shape[0]} samples (incl. augmented)")
+            print(f"  ERROR: Missing training reader directory: {rdir}")
+            return {}
+        X_r, y_r, families_r, augmented_r = load_reader_dataset(
+            rdir, class_names, include_augmented=True
+        )
+        if len(X_r) == 0:
+            print(f"  ERROR: No samples for training reader {rdr}.")
+            return {}
+        print(f"  {rdr}: {len(X_r)} samples ({np.count_nonzero(~augmented_r)} originals)")
         X_parts.append(X_r)
         y_parts.append(y_r)
+        family_parts.append(families_r)
+        augmented_parts.append(augmented_r)
 
-    if not X_parts:
-        print("  ERROR: No training data found — skipping fold.")
+    X_all = np.concatenate(X_parts, axis=0)
+    y_all = np.concatenate(y_parts, axis=0)
+    family_all = np.concatenate(family_parts, axis=0)
+    augmented_all = np.concatenate(augmented_parts, axis=0)
+
+    # Split at the *original sample* level before admitting augmentations.
+    # Class-specific selection keeps at least one source family per class
+    # available for training. A class with only one family stays in training.
+    rng = np.random.default_rng(42 + fold_idx)
+    original_groups_by_class = defaultdict(set)
+    for label, family, is_aug in zip(y_all, family_all, augmented_all):
+        if not is_aug:
+            original_groups_by_class[int(label)].add(family)
+
+    if not original_groups_by_class:
+        print("  ERROR: No original spectrograms; augmentation-only data are invalid.")
         return {}
 
-    X_train_all = np.concatenate(X_parts, axis=0)
-    y_train_all = np.concatenate(y_parts, axis=0)
+    original_families = set().union(*original_groups_by_class.values())
+    augmented_orphans = set(family_all[augmented_all]) - original_families
+    if augmented_orphans:
+        print(f"  ERROR: {len(augmented_orphans)} augmentation families have no original.")
+        return {}
 
-    # ── Shuffle + split validation set ────────────────────────────────────
-    rng = np.random.default_rng(42 + fold_idx)
-    perm = rng.permutation(len(X_train_all))
-    X_train_all = X_train_all[perm]
-    y_train_all = y_train_all[perm]
+    validation_families = set()
+    for label, groups in sorted(original_groups_by_class.items()):
+        choices = sorted(groups)
+        if len(choices) < 2:
+            print(f"  WARNING: {class_names[label]} has one original family; "
+                  "keeping it entirely in training.")
+            continue
+        count = min(len(choices) - 1, max(1, round(len(choices) * val_fraction)))
+        selected = rng.choice(len(choices), size=count, replace=False)
+        validation_families.update(choices[int(index)] for index in selected)
 
-    val_n        = max(1, int(len(X_train_all) * val_fraction))
-    X_val        = X_train_all[:val_n]
-    y_val        = y_train_all[:val_n]
-    X_train      = X_train_all[val_n:]
-    y_train      = y_train_all[val_n:]
+    if not validation_families:
+        print("  ERROR: Cannot form a leakage-free validation split; "
+              "at least one class needs two original families.")
+        return {}
 
-    print(f"  Training samples   : {len(X_train)}")
-    print(f"  Validation samples : {len(X_val)}")
+    val_family_mask = np.isin(family_all, list(validation_families))
+    train_mask = ~val_family_mask
+    # Validation uses original samples only; augmented validation data must
+    # never influence model selection, early stopping, or class-weight fitting.
+    val_mask = val_family_mask & ~augmented_all
+    if not train_mask.any() or not val_mask.any():
+        print("  ERROR: Empty training or validation split.")
+        return {}
+
+    X_train, y_train = X_all[train_mask], y_all[train_mask]
+    X_val, y_val = X_all[val_mask], y_all[val_mask]
+    assert set(family_all[train_mask]).isdisjoint(set(family_all[val_mask]))
+    print(f"  Training samples   : {len(X_train)} "
+          f"({np.count_nonzero(~augmented_all[train_mask])} originals)")
+    print(f"  Validation samples : {len(X_val)} (originals only)")
+    print(f"  Source families    : train={len(set(family_all[train_mask]))}, "
+          f"validation={len(validation_families)}")
 
     # ── Load held-out test set (originals only — no augmentation) ─────────
     test_dir = READER_DIRS[held_out_reader]
@@ -272,11 +319,21 @@ def train_fold(
         print(f"  ERROR: Held-out reader directory {test_dir} not found.")
         return {}
 
-    X_test, y_test = load_reader_dataset(test_dir, class_names, include_augmented=False)
+    X_test, y_test, _, test_augmented = load_reader_dataset(
+        test_dir, class_names, include_augmented=False
+    )
+    if test_augmented.any():
+        raise ValueError("Held-out reader unexpectedly includes augmentations")
     print(f"  Test samples (held-out {held_out_reader}) : {X_test.shape[0]}")
 
     if X_test.shape[0] == 0:
         print(f"  ERROR: No test samples for {held_out_reader} — skipping fold.")
+        return {}
+
+    unseen_test_classes = set(np.unique(y_test)) - set(np.unique(y_train))
+    if unseen_test_classes:
+        print("  ERROR: Held-out test contains classes absent from training: "
+              + ", ".join(class_names[int(index)] for index in sorted(unseen_test_classes)))
         return {}
 
     # ── DataLoaders ────────────────────────────────────────────────────────
@@ -448,7 +505,12 @@ def train_fold(
         f.write("=" * 70 + "\n\n")
         f.write(f"Test Accuracy: {test_acc*100:.4f}%\n")
         f.write(f"Best Epoch   : {stopper.best_epoch}\n")
-        f.write(f"Best Val Loss: {stopper.best_loss:.4f}\n\n")
+        f.write(f"Best Val Loss: {stopper.best_loss:.4f}\n")
+        f.write(f"Training samples: {len(X_train)} "
+                f"({np.count_nonzero(~augmented_all[train_mask])} originals)\n")
+        f.write(f"Validation samples: {len(X_val)} original samples only\n")
+        f.write(f"Source families: train={len(set(family_all[train_mask]))}, "
+                f"validation={len(validation_families)}\n\n")
         f.write("CLASSIFICATION REPORT\n")
         f.write("-" * 70 + "\n")
         f.write(report)
@@ -471,6 +533,9 @@ def train_fold(
         "epochs_ran":   len(train_accs),
         "cm":           cm,
         "class_names":  class_names,
+        "train_groups": len(set(family_all[train_mask])),
+        "val_groups": len(validation_families),
+        "val_originals": len(X_val),
     }
 
 
@@ -489,7 +554,9 @@ def write_summary(results: list[dict]):
             f.write(f"Fold {r['fold']}  |  Held-out: {r['held_out']:3s}  "
                     f"|  Train: {r['train']}  "
                     f"|  Test Acc: {acc*100:.2f}%  "
-                    f"|  Best Epoch: {r['best_epoch']}\n")
+                    f"|  Best Epoch: {r['best_epoch']} "
+                    f"| Source families: train={r['train_groups']}, val={r['val_groups']}"
+                    f" | Val originals={r['val_originals']}\n")
         f.write("\n" + "-" * 70 + "\n")
         if accs:
             f.write(f"Mean Test Accuracy : {np.mean(accs)*100:.2f}%\n")
@@ -590,6 +657,10 @@ def main():
         if result:
             all_results.append(result)
 
+    if len(all_results) != len(set(args.folds)):
+        print("ERROR: Some requested folds were not completed. "
+              "Not writing a potentially misleading LORO summary.")
+        sys.exit(1)
     write_summary(all_results)
 
     print("\n" + "=" * 70)
